@@ -9,7 +9,7 @@ on:
         type: string
 
       output_format:
-        description: 'Output type'
+        description: 'نوع خروجی'
         required: true
         type: choice
         options:
@@ -18,19 +18,19 @@ on:
         default: 'mp4 (video)'
 
       desired_quality:
-        description: 'Quality (720p, 1080p | audio: 192kbps, 320kbps)'
+        description: 'کیفیت (ویدیو: 720p, 1080p | صدا: 192kbps, 320kbps)'
         required: false
         type: string
         default: '720p'
 
       max_part_mb:
-        description: 'حداکثر حجم هر قسمت (MB) - 0 = خودکار'
+        description: 'حداکثر حجم هر قسمت (MB) - 0 = خودکار ۱۸۰۰ مگابایت'
         required: false
         type: string
         default: '1800'
 
       upload_method:
-        description: '📤 روش آپلود نهایی'
+        description: '📤 روش ذخیره نهایی'
         required: true
         type: choice
         options:
@@ -53,67 +53,156 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - name: Checkout
+      - name: 📂 Checkout Repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install tools
+      - name: 🔧 Install Dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y zip curl python3
 
-      # ── Retrieve + Download + Split (مشترک) ─────────────────────
-      - name: Get Download Link & Download
+      - name: 🔗 Get Download Link
         id: retrieve
         run: |
-          # ... (کد دریافت لینک و دانلود همان نسخه قبلی) ...
-          # برای جلوگیری از طولانی شدن پیام، کد کامل را اینجا خلاصه کردم
           python3 << 'EOF'
-          # [کد دریافت لینک API قبلی که قبلاً دادم]
-          # در آخر:
-          print("::set-output name=filename::" + fname)
-          EOF
+          import os, sys, time, re, requests
 
-      - name: Split large file if needed
+          URL = os.environ.get('INPUT_URL')
+          FMT = os.environ.get('INPUT_FORMAT')
+          QUAL = os.environ.get('INPUT_QUALITY')
+
+          is_audio = FMT == 'mp3'
+          if is_audio:
+              QUAL = QUAL if QUAL in ('64kbps','128kbps','192kbps','320kbps') else '192kbps'
+          else:
+              QUAL = QUAL if QUAL in ('720p','1080p') else '720p'
+
+          payload = {
+              "url": URL,
+              "os": "linux",
+              "output": {"type": "audio" if is_audio else "video", "format": FMT}
+          }
+          if is_audio:
+              payload["audio"] = {"bitrate": QUAL}
+          else:
+              payload["output"]["quality"] = QUAL
+
+          s = requests.Session()
+          s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+          s.get("https://media.ytmp3.gg/")
+
+          resp = s.post("https://hub.ytconvert.org/api/download", json=payload, timeout=30)
+          resp.raise_for_status()
+          data = resp.json()
+
+          status_url = data.get('statusUrl')
+          title = data.get('title', 'video')
+
+          dl_url = None
+          for _ in range(150):
+              time.sleep(2)
+              r = s.get(status_url, timeout=20)
+              status = r.json()
+              if status.get('status') == 'completed':
+                  dl_url = status.get('downloadUrl')
+                  break
+              if status.get('status') == 'failed':
+                  print("::error::Server failed to prepare the video")
+                  sys.exit(1)
+
+          if not dl_url:
+              print("::error::Could not get download link")
+              sys.exit(1)
+
+          # Safe filename
+          vid = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', URL)[1]
+          clean = re.sub(r'[^a-zA-Z0-9\-_()\[\]]', '_', title.replace(' ', '_'))
+          clean = re.sub(r'_+', '_', clean).strip('_')[:70] or vid
+          fname = f"{clean}_{vid}_{QUAL}.{FMT}"
+
+          with open(".download_info", "w", encoding="utf-8") as f:
+              f.write(f"{dl_url}\n{fname}\n{title}")
+
+          print(f"::set-output name=filename::{fname}")
+          print(f"::set-output name=title::{title}")
+          EOF
+        env:
+          INPUT_URL: ${{ github.event.inputs.video_url }}
+          INPUT_FORMAT: ${{ github.event.inputs.output_format == 'mp3 (audio only)' && 'mp3' || 'mp4' }}
+          INPUT_QUALITY: ${{ github.event.inputs.desired_quality }}
+
+      - name: 📥 Download File
         run: |
-          # [کد اسپلیت قبلی که قبلاً دادم - با حد 1800MB]
+          DL_URL=$(head -1 .download_info)
+          FILENAME=$(sed -n '2p' .download_info)
+          mkdir -p temp_dl
+          echo "Downloading: $FILENAME"
+          curl -L --fail --progress-bar -o "temp_dl/$FILENAME" "$DL_URL"
+          echo "filename=$FILENAME" >> $GITHUB_OUTPUT
+
+      - name: ✂️ Split Large File (if needed)
+        run: |
+          FILENAME="${{ steps.retrieve.outputs.filename }}"
           THRESH_MB=${{ github.event.inputs.max_part_mb }}
+
           if [[ "$THRESH_MB" -le 0 ]] || [[ "$THRESH_MB" -gt 1900 ]]; then
             THRESH_MB=1800
           fi
-          # ... بقیه کد اسپلیت ...
 
-      # ── Upload Method Selection ─────────────────────
-      - name: Push to Repository
+          FILESIZE=$(stat -c%s "temp_dl/$FILENAME" 2>/dev/null || echo 0)
+          THRESH_BYTES=$((THRESH_MB * 1024 * 1024))
+
+          cd temp_dl
+
+          if [ "$FILESIZE" -gt "$THRESH_BYTES" ]; then
+            echo "🔪 Splitting file (${FILESIZE} bytes) into ${THRESH_MB}MB parts..."
+            BASE="${FILENAME%.*}"
+            zip -r -s "${THRESH_MB}m" "../${BASE}.zip" "$FILENAME"
+            rm "$FILENAME"
+            echo "✅ File successfully split."
+          else
+            echo "📦 File is small enough, no splitting needed."
+            mv "$FILENAME" ..
+          fi
+          cd ..
+
+      - name: 📤 Push to Repository
         if: github.event.inputs.upload_method == 'repository (push to repo)'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add downloads/ temp_dl/ *.zip 2>/dev/null || true
+          mkdir -p downloads
+          mv temp_dl/* downloads/ 2>/dev/null || true
+          mv *.zip downloads/ 2>/dev/null || true
+          
+          git add downloads/
           git commit -m "⬇️ YouTube: ${{ steps.retrieve.outputs.filename }} [skip ci]" || echo "Nothing to commit"
           git push
 
-      - name: Upload to GitHub Releases
+      - name: 📤 Upload to GitHub Releases
         if: github.event.inputs.upload_method == 'release (GitHub Releases)'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.release_tag || format('yt-{0}', github.run_number) }}
-          name: ${{ format('YouTube Download - {0}', steps.retrieve.outputs.filename) }}
+          name: ${{ format('YouTube - {0}', steps.retrieve.outputs.filename) }}
           body: |
             **دانلود از یوتیوب**
-            
-            لینک: ${{ github.event.inputs.video_url }}
-            کیفیت: ${{ github.event.inputs.desired_quality }}
-            تاریخ: $(date '+%Y-%m-%d %H:%M')
+
+            **عنوان:** ${{ steps.retrieve.outputs.title }}
+            **لینک ویدیو:** ${{ github.event.inputs.video_url }}
+            **کیفیت:** ${{ github.event.inputs.desired_quality }}
+            **تاریخ:** $(date '+%Y-%m-%d %H:%M:%S')
+
+            Powered by Meli-Action
           files: |
             temp_dl/*
             *.zip
-            downloads/*
           token: ${{ secrets.GITHUB_TOKEN }}
           draft: false
           prerelease: false
 
-      - name: Cleanup
+      - name: 🧹 Cleanup
         if: always()
-        run: rm -rf temp_dl downloads .download_info *.zip 2>/dev/null || true
+        run: rm -rf temp_dl .download_info *.zip 2>/dev/null || true
